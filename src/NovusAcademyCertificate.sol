@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/Counters.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "lib/openzeppelin-contracts/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import "lib/openzeppelin-contracts/contracts/access/Ownable.sol";
+import "lib/openzeppelin-contracts/contracts/utils/Counters.sol";
+import "lib/openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
+import "lib/openzeppelin-contracts/contracts/security/Pausable.sol";
 
 /**
  * @title NovusAcademyCertificate
- * @dev ERC721 token for course completion certificates
+ * @dev ERC721 token for course completion certificates with enhanced security
  */
-contract NovusAcademyCertificate is ERC721URIStorage, Ownable {
+contract NovusAcademyCertificate is ERC721URIStorage, Ownable, ReentrancyGuard, Pausable {
     using Counters for Counters.Counter;
 
     Counters.Counter private _tokenIds;
@@ -24,16 +25,52 @@ contract NovusAcademyCertificate is ERC721URIStorage, Ownable {
     // Address of the NovusAcademyPlatform contract that can mint certificates
     address private _platformAddress;
 
-    event CertificateMinted(address indexed student, uint256 courseId, uint256 certificateId);
+    // Flag to track initialization status
+    bool private _initialized;
 
-    constructor() ERC721("Novus Academy Certificate", "NAC") Ownable(msg.sender) {}
+    event CertificateMinted(address indexed student, uint256 courseId, uint256 certificateId);
+    event PlatformAddressChanged(address indexed oldPlatform, address indexed newPlatform);
+
+    modifier onlyPlatform() {
+        require(msg.sender == _platformAddress, "NAC: caller is not the platform");
+        _;
+    }
+
+    constructor() ERC721("Novus Academy Certificate", "NAC") Ownable() {
+        _pause(); // Start paused until platform address is set
+    }
 
     /**
      * @dev Sets the platform address that is authorized to mint certificates
      * @param platformAddress Address of the NovusAcademyPlatform contract
      */
     function setPlatformAddress(address platformAddress) external onlyOwner {
+        require(platformAddress != address(0), "NAC: platform address cannot be zero");
+
+        // For security, emit event with old and new address
+        emit PlatformAddressChanged(_platformAddress, platformAddress);
+
         _platformAddress = platformAddress;
+
+        // Unpause the contract if it was initially paused
+        if (paused()) {
+            _unpause();
+        }
+    }
+
+    /**
+     * @dev Emergency pause function for critical situations
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @dev Unpause the contract
+     */
+    function unpause() external onlyOwner {
+        require(_platformAddress != address(0), "NAC: platform address not set");
+        _unpause();
     }
 
     /**
@@ -43,8 +80,15 @@ contract NovusAcademyCertificate is ERC721URIStorage, Ownable {
      * @param metadataURI IPFS URI to the certificate metadata
      * @return certificateId ID of the minted certificate
      */
-    function mintCertificate(address student, uint256 courseId, string memory metadataURI) external returns (uint256) {
-        require(msg.sender == _platformAddress, "Only platform can mint certificates");
+    function mintCertificate(address student, uint256 courseId, string memory metadataURI)
+        external
+        onlyPlatform
+        whenNotPaused
+        nonReentrant
+        returns (uint256)
+    {
+        require(student != address(0), "NAC: cannot mint to zero address");
+        require(bytes(metadataURI).length > 0, "NAC: empty metadata URI");
 
         _tokenIds.increment();
         uint256 certificateId = _tokenIds.current();
@@ -66,7 +110,7 @@ contract NovusAcademyCertificate is ERC721URIStorage, Ownable {
      * @return courseId ID of the course
      */
     function getCertificateCourse(uint256 certificateId) external view returns (uint256) {
-        require(_exists(certificateId), "Certificate does not exist");
+        require(_exists(certificateId), "NAC: certificate does not exist");
         return _certificateToCourse[certificateId];
     }
 
@@ -96,40 +140,20 @@ contract NovusAcademyCertificate is ERC721URIStorage, Ownable {
 
         return false;
     }
-}
-
-/**
- * @title NovusAcademyFactory
- * @dev Factory contract to deploy the entire Novus Academy+ system
- */
-contract NovusAcademyFactory {
-    event PlatformDeployed(address certificateContract, address platformContract);
 
     /**
-     * @dev Deploys the Novus Academy+ platform
-     * @return certificateAddress Address of the certificate contract
-     * @return platformAddress Address of the platform contract
+     * @dev Checks if platform address is set
+     * @return bool True if platform address is set
      */
-    function deployPlatform() external returns (address certificateAddress, address platformAddress) {
-        // Deploy certificate contract
-        NovusAcademyCertificate certificateContract = new NovusAcademyCertificate();
-        certificateAddress = address(certificateContract);
+    function isPlatformSet() external view returns (bool) {
+        return _platformAddress != address(0);
+    }
 
-        // Deploy platform contract
-        NovusAcademyPlatform platformContract = new NovusAcademyPlatform(certificateAddress);
-        platformAddress = address(platformContract);
-
-        // Set platform address in certificate contract
-        certificateContract.setPlatformAddress(platformAddress);
-
-        // Transfer ownership of certificate contract to msg.sender
-        certificateContract.transferOwnership(msg.sender);
-
-        // Transfer ownership of platform contract to msg.sender
-        platformContract.transferOwnership(msg.sender);
-
-        emit PlatformDeployed(certificateAddress, platformAddress);
-
-        return (certificateAddress, platformAddress);
+    /**
+     * @dev Returns the platform address
+     * @return address The platform address
+     */
+    function getPlatformAddress() external view onlyOwner returns (address) {
+        return _platformAddress;
     }
 }

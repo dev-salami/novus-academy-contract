@@ -1,8 +1,21 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "lib/openzeppelin-contracts/contracts/access/Ownable.sol";
+import "lib/openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
+import "lib/openzeppelin-contracts/contracts/security/Pausable.sol";
+import "lib/openzeppelin-contracts/contracts/utils/Counters.sol";
+
+interface NovusAcademyCertificate {
+    function mintCertificate(address student, uint256 courseId, string memory metadataURI) external returns (uint256);
+    function isPlatformSet() external view returns (bool);
+}
+
 /**
  * @title NovusAcademyPlatform
- * @dev Main contract for the Novus Academy+ platform
+ * @dev Main contract for the Novus Academy+ platform with enhanced security
  */
-contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
+contract NovusAcademyPlatform is Ownable, ReentrancyGuard, Pausable {
     using Counters for Counters.Counter;
 
     Counters.Counter private _courseIds;
@@ -13,6 +26,12 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
     // Platform fee percentage (in basis points, e.g., 250 = 2.5%)
     uint256 private _platformFeePercentage = 250;
 
+    // Maximum platform fee (10%)
+    uint256 private constant _MAX_PLATFORM_FEE = 1000;
+
+    // Track platform fees separately
+    uint256 private _platformBalance;
+
     struct Course {
         uint256 id;
         string title;
@@ -22,6 +41,7 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
         uint256 price;
         bool isActive;
         uint256 totalEnrollments;
+        uint256 creationDate;
     }
 
     struct Enrollment {
@@ -51,6 +71,9 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
     // Maps author address to their earned balance
     mapping(address => uint256) private _authorBalances;
 
+    // Emergency admin address
+    address private _emergencyAdmin;
+
     // Events
     event CourseCreated(uint256 indexed courseId, address indexed author, string title, uint256 price);
     event CourseUpdated(uint256 indexed courseId, string title, uint256 price, bool isActive);
@@ -59,9 +82,32 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
     event CertificateIssued(uint256 indexed courseId, address indexed student, uint256 certificateId);
     event AuthorWithdrawal(address indexed author, uint256 amount);
     event PlatformFeeUpdated(uint256 newFeePercentage);
+    event EmergencyAdminChanged(address indexed oldAdmin, address indexed newAdmin);
+    event PlatformWithdrawal(address indexed owner, uint256 amount);
 
-    constructor(address certificateContract) Ownable(msg.sender) {
+    // Modifiers
+    modifier onlyEmergencyAdminOrOwner() {
+        require(msg.sender == _emergencyAdmin || msg.sender == owner(), "NAP: not emergency admin or owner");
+        _;
+    }
+
+    modifier courseExists(uint256 courseId) {
+        require(_courses[courseId].author != address(0), "NAP: course does not exist");
+        _;
+    }
+
+    modifier onlyCourseAuthor(uint256 courseId) {
+        require(_courses[courseId].author == msg.sender, "NAP: only author can perform this action");
+        _;
+    }
+
+    constructor(address certificateContract) Ownable() {
+        require(certificateContract != address(0), "NAP: certificate contract cannot be zero address");
         _certificateContract = NovusAcademyCertificate(certificateContract);
+
+        _certificateContract.isPlatformSet();
+        // Set emergency admin to owner initially
+        _emergencyAdmin = msg.sender;
     }
 
     /**
@@ -69,9 +115,33 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
      * @param newFeePercentage New fee percentage in basis points (e.g., 250 = 2.5%)
      */
     function updatePlatformFee(uint256 newFeePercentage) external onlyOwner {
-        require(newFeePercentage <= 1000, "Fee cannot exceed 10%");
+        require(newFeePercentage <= _MAX_PLATFORM_FEE, "NAP: fee cannot exceed 10%");
         _platformFeePercentage = newFeePercentage;
         emit PlatformFeeUpdated(newFeePercentage);
+    }
+
+    /**
+     * @dev Sets or updates the emergency admin
+     * @param newEmergencyAdmin Address of the new emergency admin
+     */
+    function setEmergencyAdmin(address newEmergencyAdmin) external onlyOwner {
+        require(newEmergencyAdmin != address(0), "NAP: emergency admin cannot be zero address");
+        emit EmergencyAdminChanged(_emergencyAdmin, newEmergencyAdmin);
+        _emergencyAdmin = newEmergencyAdmin;
+    }
+
+    /**
+     * @dev Pause the platform in emergency situations
+     */
+    function emergencyPause() external onlyEmergencyAdminOrOwner {
+        _pause();
+    }
+
+    /**
+     * @dev Unpause the platform
+     */
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     /**
@@ -84,8 +154,14 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
      */
     function createCourse(string memory title, string memory description, string memory metadataURI, uint256 price)
         external
+        whenNotPaused
+        nonReentrant
         returns (uint256)
     {
+        require(bytes(title).length > 0, "NAP: title cannot be empty");
+        require(bytes(description).length > 0, "NAP: description cannot be empty");
+        require(bytes(metadataURI).length > 0, "NAP: metadata URI cannot be empty");
+
         _courseIds.increment();
         uint256 courseId = _courseIds.current();
 
@@ -97,7 +173,8 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
             author: msg.sender,
             price: price,
             isActive: true,
-            totalEnrollments: 0
+            totalEnrollments: 0,
+            creationDate: block.timestamp
         });
 
         _authorCourses[msg.sender].push(courseId);
@@ -123,9 +200,7 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
         string memory metadataURI,
         uint256 price,
         bool isActive
-    ) external {
-        require(_courses[courseId].author == msg.sender, "Only author can update course");
-
+    ) external whenNotPaused nonReentrant courseExists(courseId) onlyCourseAuthor(courseId) {
         Course storage course = _courses[courseId];
 
         if (bytes(title).length > 0) {
@@ -153,23 +228,25 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
      * @dev Enrolls a student in a course
      * @param courseId ID of the course to enroll in
      */
-    function enrollInCourse(uint256 courseId) external payable nonReentrant {
+    function enrollInCourse(uint256 courseId) external payable whenNotPaused nonReentrant courseExists(courseId) {
         Course storage course = _courses[courseId];
 
-        require(course.isActive, "Course is not active");
-        require(msg.value >= course.price, "Insufficient payment");
-        require(_enrollmentDetails[courseId][msg.sender].student == address(0), "Already enrolled");
+        require(course.isActive, "NAP: course is not active");
+        require(msg.value >= course.price, "NAP: insufficient payment");
+        require(_enrollmentDetails[courseId][msg.sender].student == address(0), "NAP: already enrolled");
 
         // Calculate platform fee
         uint256 platformFee = (course.price * _platformFeePercentage) / 10000;
         uint256 authorPayment = course.price - platformFee;
 
-        // Update author balance
+        // Update balances
         _authorBalances[course.author] += authorPayment;
+        _platformBalance += platformFee;
 
         // Refund excess payment if any
         if (msg.value > course.price) {
-            payable(msg.sender).transfer(msg.value - course.price);
+            (bool success,) = payable(msg.sender).call{value: msg.value - course.price}("");
+            require(success, "NAP: refund failed");
         }
 
         // Record enrollment
@@ -196,20 +273,55 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
      * @param student Address of the student
      * @param certificateURI IPFS URI to the certificate metadata
      */
-    function completeCourse(uint256 courseId, address student, string memory certificateURI) external {
-        Course storage course = _courses[courseId];
-        require(course.author == msg.sender, "Only author can mark completion");
+    function completeCourse(uint256 courseId, address student, string memory certificateURI)
+        external
+        whenNotPaused
+        nonReentrant
+        courseExists(courseId)
+        onlyCourseAuthor(courseId)
+    {
+        require(student != address(0), "NAP: student cannot be zero address");
+        require(bytes(certificateURI).length > 0, "NAP: certificate URI cannot be empty");
 
         Enrollment storage enrollment = _enrollmentDetails[courseId][student];
-        require(enrollment.student != address(0), "Student not enrolled");
-        require(!enrollment.completed, "Course already completed");
+        require(enrollment.student != address(0), "NAP: student not enrolled");
+        require(!enrollment.completed, "NAP: course already completed");
 
         enrollment.completed = true;
         enrollment.completionDate = block.timestamp;
 
         emit CourseCompleted(courseId, student);
 
-        // Issue certificate
+        try _certificateContract.mintCertificate(student, courseId, certificateURI) returns (uint256 certificateId) {
+            enrollment.certificateIssued = true;
+            enrollment.certificateId = certificateId;
+
+            emit CertificateIssued(courseId, student, certificateId);
+        } catch {
+            // Certificate minting failed, but course completion is still recorded
+            // This allows retrying certificate issuance later if needed
+            enrollment.certificateIssued = false;
+        }
+    }
+
+    /**
+     * @dev Retry certificate issuance if it failed during course completion
+     * @param courseId ID of the completed course
+     * @param student Address of the student
+     * @param certificateURI IPFS URI to the certificate metadata
+     */
+    function retryCertificateIssuance(uint256 courseId, address student, string memory certificateURI)
+        external
+        whenNotPaused
+        nonReentrant
+        courseExists(courseId)
+        onlyCourseAuthor(courseId)
+    {
+        Enrollment storage enrollment = _enrollmentDetails[courseId][student];
+        require(enrollment.student != address(0), "NAP: student not enrolled");
+        require(enrollment.completed, "NAP: course not completed");
+        require(!enrollment.certificateIssued, "NAP: certificate already issued");
+
         uint256 certificateId = _certificateContract.mintCertificate(student, courseId, certificateURI);
 
         enrollment.certificateIssued = true;
@@ -223,11 +335,13 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
      */
     function authorWithdraw() external nonReentrant {
         uint256 amount = _authorBalances[msg.sender];
-        require(amount > 0, "No balance to withdraw");
+        require(amount > 0, "NAP: no balance to withdraw");
 
+        // Set balance to 0 before transfer to prevent reentrancy
         _authorBalances[msg.sender] = 0;
 
-        payable(msg.sender).transfer(amount);
+        (bool success,) = payable(msg.sender).call{value: amount}("");
+        require(success, "NAP: transfer failed");
 
         emit AuthorWithdrawal(msg.sender, amount);
     }
@@ -236,10 +350,16 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
      * @dev Allows the platform owner to withdraw accumulated platform fees
      */
     function platformWithdraw() external onlyOwner nonReentrant {
-        uint256 platformBalance = address(this).balance;
-        require(platformBalance > 0, "No balance to withdraw");
+        uint256 amount = _platformBalance;
+        require(amount > 0, "NAP: no platform fees to withdraw");
 
-        payable(owner()).transfer(platformBalance);
+        // Reset platform balance before transfer
+        _platformBalance = 0;
+
+        (bool success,) = payable(owner()).call{value: amount}("");
+        require(success, "NAP: transfer failed");
+
+        emit PlatformWithdrawal(owner(), amount);
     }
 
     /**
@@ -247,7 +367,7 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
      * @param courseId ID of the course
      * @return Course details
      */
-    function getCourse(uint256 courseId) external view returns (Course memory) {
+    function getCourse(uint256 courseId) external view courseExists(courseId) returns (Course memory) {
         return _courses[courseId];
     }
 
@@ -257,7 +377,12 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
      * @param student Address of the student
      * @return Enrollment details
      */
-    function getEnrollment(uint256 courseId, address student) external view returns (Enrollment memory) {
+    function getEnrollment(uint256 courseId, address student)
+        external
+        view
+        courseExists(courseId)
+        returns (Enrollment memory)
+    {
         return _enrollmentDetails[courseId][student];
     }
 
@@ -284,7 +409,7 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
      * @param courseId ID of the course
      * @return Array of student addresses
      */
-    function getCourseStudents(uint256 courseId) external view returns (address[] memory) {
+    function getCourseStudents(uint256 courseId) external view courseExists(courseId) returns (address[] memory) {
         return _courseEnrollments[courseId];
     }
 
@@ -303,5 +428,29 @@ contract NovusAcademyPlatform is Ownable, ReentrancyGuard {
      */
     function getPlatformFeePercentage() external view returns (uint256) {
         return _platformFeePercentage;
+    }
+
+    /**
+     * @dev Gets the current platform balance
+     * @return Current platform balance
+     */
+    function getPlatformBalance() external view returns (uint256) {
+        return _platformBalance;
+    }
+
+    /**
+     * @dev Gets the emergency admin address
+     * @return Address of the emergency admin
+     */
+    function getEmergencyAdmin() external view onlyOwner returns (address) {
+        return _emergencyAdmin;
+    }
+
+    /**
+     * @dev Get the certificate contract address
+     * @return Address of the certificate contract
+     */
+    function getCertificateContract() external view returns (address) {
+        return address(_certificateContract);
     }
 }
